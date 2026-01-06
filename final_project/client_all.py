@@ -1,0 +1,260 @@
+import socket
+import select
+import sys
+import threading
+import time
+
+BUFFER_SIZE = 1024
+Game_finished = False
+Q_counter = -1
+Q_finished = [0] * 5
+TimeOut_flag = 0
+answer_value = -1
+
+Question_Set = [
+    [
+        "What should you do if someone shows signs of a stroke?",
+        "1. Wait and see if they get better",
+        "2. Give them painkillers and let them rest",
+        "3. Call an ambulance immediately",
+        "4. Massage them to help relax"
+    ],
+    [
+        "Which activity can help improve hand and arm movement after a stroke?",
+        "1. Watching TV",
+        "2. Playing simple games with hands",
+        "3. Taking long naps",
+        "4. Drinking cold water"
+    ],
+    [
+        "If a stroke patient feels tired during rehab, what should they do?",
+        "1. Stop all rehab forever",
+        "2. Only do rehab once a week",
+        "3. Rest a bit, then continue slowly",
+        "4. Drink soda for energy"
+    ],
+    [
+        "Which of the following is a healthy daily habit?",
+        "1. Smoking after meals",
+        "2. Watching TV all day",
+        "3. Skipping breakfast",
+        "4. Drinking plenty of water"
+    ],
+    [
+        "What should you do if you feel dizzy or lightheaded?",
+        "1. Sit or lie down and tell someone",
+        "2. Ignore it and keep walking",
+        "3. Drive a car quickly",
+        "4. Start running"
+    ]
+]
+
+def Show_Q(n):
+    if n < 0 or n >= len(Question_Set):
+        print(f"Invalid question number: {n}")
+        return
+    print(f"Question {n}:")
+    for line in Question_Set[n]:
+        print(line)
+
+def Get_Keyboard_Value():
+    """有輸入回傳輸入值, 沒輸入回傳-1"""
+    ready, _, _ = select.select([sys.stdin], [], [], 0)
+    if ready:
+        buf = sys.stdin.readline()
+        try:
+            val = int(buf.strip())
+            return val
+        except:
+            return -1
+    return -1
+
+def IMU():
+    """IMU計數達到設定值後回傳1, 期間Q_finished就回傳-1"""
+    global Q_counter
+    counter = 0
+    while True:
+        if Q_finished[Q_counter]:
+            return -1
+        ready, _, _ = select.select([sys.stdin], [], [], 0)
+        if ready:
+            buf = sys.stdin.readline()
+            try:
+                inputval = int(buf.strip())
+                if inputval == 1:
+                    counter += 1
+                    if counter > 5:
+                        return 1
+            except:
+                pass
+        time.sleep(0.1)
+
+def Send_Answer_Request(Server_fd):
+    action = IMU()
+    if action == 1:
+        msg = "Request_to_Answer 0".encode()
+        Server_fd.sendall(msg)
+    elif action == -1:
+        msg = "Q_finished 0".encode()
+        Server_fd.sendall(msg)
+        return
+    else:
+        print("Something error in IMU()")
+        sys.exit(1)
+
+def countdown_display_thread(timeout, stop_event):
+    for i in range(timeout, 0, -1):
+        if stop_event.is_set():
+            break
+        print(f"\rTime left: {i:2d} seconds ", end="", flush=True)
+        time.sleep(1)
+    print("\r                     \r", end="")  # 清空倒數顯示
+
+def Answer_Phase(Server_fd):
+    global answer_value, TimeOut_flag
+    answer_value = -1
+    TimeOut_flag = 0
+    timeout = 10
+    stop_event = threading.Event()
+    t = threading.Thread(target=countdown_display_thread, args=(timeout, stop_event))
+    t.start()
+    start_time = time.time()
+    while True:
+        val = Get_Keyboard_Value()
+        if val > 0:
+            answer_value = val
+            stop_event.set()
+            break
+        if time.time() - start_time >= timeout:
+            TimeOut_flag = 1
+            stop_event.set()
+            break
+        time.sleep(0.1)
+
+    t.join()
+    if answer_value == -1:
+        print("Time Out! You need to resend the request")
+    else:
+        print(f"Your answer is {answer_value}")
+
+    # 發送答案
+    msg = f"ANSWER {answer_value}".encode()
+    Server_fd.sendall(msg)
+
+def Listen_Q_finished(Server_fd2):
+    global Q_finished, Q_counter
+    while True:
+        buffer = Server_fd2.recv(BUFFER_SIZE)
+        if not buffer:
+            print("error receive message from server (port2)")
+            sys.exit(1)
+        parts = buffer.decode().strip().split()
+        if len(parts) >= 2 and parts[0] == "Q_finished":
+            try:
+                index = int(parts[1])
+                if 0 <= index < 5:
+                    if index == Q_counter:
+                        Q_finished[index] = 1
+                        print(f"[System] Marked Q_finished[{index}] = 1 from port2")
+                    else:
+                        print(f"Something wrong! Q_counter = {Q_counter}, Q_finished index = {index}")
+            except:
+                print(f"[Warning] Failed to parse Q_finished: {buffer.decode().strip()}")
+        else:
+            print(f"[Warning] Unknown message from port2: {buffer.decode().strip()}")
+
+def main():
+    if len(sys.argv) != 4:
+        print(f"Usage: {sys.argv[0]} <ip> <port1> <port2>")
+        sys.exit(1)
+
+    server_ip = sys.argv[1]
+    server_port1 = int(sys.argv[2])
+    server_port2 = int(sys.argv[3])
+
+    Server_fd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    Server_fd.connect((server_ip, server_port1))
+
+    Server_fd2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    Server_fd2.connect((server_ip, server_port2))
+
+    # 啟動 Q_finished 監聽執行緒
+    t_port2 = threading.Thread(target=Listen_Q_finished, args=(Server_fd2,), daemon=True)
+    t_port2.start()
+
+    global Game_finished, Q_counter, Q_finished
+    while True:  # new game
+        Game_finished = False
+        num = 0
+        show = ""
+        command = ""
+        Q_counter = -1
+        Q_finished = [0] * 5
+
+        while not Game_finished:
+            buffer = Server_fd.recv(BUFFER_SIZE)
+            if not buffer:
+                print("error receive message from server")
+                sys.exit(1)
+            # 解析 command, num, show
+            s = buffer.decode()
+            parts = s.strip().split(maxsplit=2)
+            if len(parts) >= 1:
+                command = parts[0]
+            if len(parts) >= 2:
+                try:
+                    num = int(parts[1])
+                except:
+                    num = 0
+            if len(parts) >= 3:
+                show = parts[2]
+            else:
+                show = ""
+
+            if command == "Connect":
+                print(show, end="")
+                continue
+            elif command == "NewQ":
+                Show_Q(num)
+                if Q_counter < 0:
+                    Q_counter += 1
+                elif Q_counter >= 5:
+                    print("Something error about NewQ")
+                else:
+                    Q_finished[Q_counter] = 1
+                    Q_counter += 1
+                Send_Answer_Request(Server_fd)
+            elif command == "PleaseAnswer":
+                print(show, end="")
+                Answer_Phase(Server_fd)
+            elif command == "PleaseWait":
+                print(show, end="")
+                continue
+            elif command == "AnswerTimeOut":
+                Send_Answer_Request(Server_fd)
+            elif command == "AnsweerCorrect":
+                print(show, end="")
+                continue
+            elif command == "AnswerWrong":
+                print(show, end="")
+                Send_Answer_Request(Server_fd)
+            elif command == "Gamefinished":
+                print(show, end="")
+                Q_finished[Q_counter] = 1
+                if Q_counter != 4:
+                    print("Q_counter should be 4! Something wrong!")
+                Game_finished = True
+                break
+            else:
+                print("There's something unexpected receive from Server")
+                sys.exit(1)
+
+        # 遊戲結束顯示
+        buffer = Server_fd.recv(BUFFER_SIZE)
+        if not buffer:
+            print("error receive message from server")
+            sys.exit(1)
+        print(buffer.decode(), end="")
+
+if __name__ == "__main__":
+    main()
