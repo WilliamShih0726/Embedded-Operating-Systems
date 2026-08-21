@@ -14,12 +14,6 @@ __pycache__/
 venv/
 .ipynb_checkpoints/
 
-# ===== common outputs =====
-output/
-outputs/
-result/
-results/
-
 # ===== archives =====
 *.zip
 *.rar
